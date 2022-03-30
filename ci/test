@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+
+# Usage:
+# ./test [platform] [database] [authn-mode]
+#
+# Note: This script expects several environment variables to be
+# defined and exported, some of which are sensitive/secret values.
+# It is for this that we recommend to always call this script using summon.
+#
+# Recommended usage:
+# summon --environment [platform] ./test [platform] [database]
+#
+# platform: gke or oc
+# database: postgres or mysql
+# authn-mode: annotation-based or host-id-based
+
+set -euo pipefail
+IFS=$'\n\t'
+export CONJUR_OSS="${CONJUR_OSS:-false}"
+export KUBE_CLI_DELETE_TIMEOUT="${KUBE_CLI_DELETE_TIMEOUT:-120s}"
+
+# Clean up when script completes
+function finish {
+  announce 'Wrapping up and removing test environment'
+
+  if [[ "$CONJUR_OSS" == "true" ]]; then
+    runDockerCommand "
+./stop
+helm --namespace '$CONJUR_NAMESPACE_NAME' delete '${HELM_RELEASE}'
+kubectl delete --timeout='$KUBE_CLI_DELETE_TIMEOUT' \
+  namespace $CONJUR_NAMESPACE_NAME || \
+  (echo 'ERROR: Delete of namespace $CONJUR_NAMESPACE_NAME failed' && \
+   echo 'Showing residual resources in namespace:' && \
+   kubectl --namespace '$CONJUR_NAMESPACE_NAME' describe all)
+    "
+  else
+    # Stop the running processes
+    runDockerCommand "
+./stop
+cd kubernetes-conjur-deploy-$UNIQUE_TEST_ID && ./stop
+    "
+
+    # Remove the deploy directory
+    rm -rf ../kubernetes-conjur-deploy-$UNIQUE_TEST_ID
+
+    # Delete registry images that were used
+    deleteRegistryImage "$DOCKER_REGISTRY_PATH/haproxy:$CONJUR_NAMESPACE_NAME"
+    deleteRegistryImage "$DOCKER_REGISTRY_PATH/conjur-appliance:$CONJUR_NAMESPACE_NAME"
+  fi
+
+}
+trap finish EXIT
+
+# Verify that arguments are passed to the script
+function printUsage() {
+  echo "---"
+  echo "Usage:"
+  echo "./test [platform] [database] [authn-mode]"
+  echo ""
+  echo "Note: This script expects several environment variables to be defined and exported, some of which are sensitive/secret values. It is for this that we recommend to always call this script using summon."
+  echo ""
+  echo "Recommended Usage:"
+  echo "summon --environment [platform] ./test [platform] [database] [authn-mode]"
+  echo ""
+  echo "platform: gke or oc"
+  echo "database: postgres or mysql"
+  echo "authn-mode: annotation-based or host-id-based"
+
+  exit 1
+}
+
+function main() {
+  announce 'Checking arguments'
+  checkArguments
+
+  announce 'Preparing test environment'
+  prepareTestEnvironment
+
+  announce 'Deploying Conjur'
+  deployConjur
+
+  announce 'Deploying demo'
+  deployDemo
+}
+
+function deployConjur() {
+  if [[ "$CONJUR_OSS" == "true" ]]; then
+    cd ..
+    local workdir=kubernetes-conjur-deploy-$UNIQUE_TEST_ID
+    mkdir -p "${workdir}"
+    cd "${workdir}"
+
+    export CONJUR_OSS_HELM_CHART_VERSION=2.0.4
+    export CONJUR_OSS_HELM_INSTALLED=true
+    export HELM_RELEASE="${CONJUR_NAMESPACE_NAME}"
+
+    export CONJUR_ADMIN_PASSWORD # set below
+
+    # TODO: figure out why the cli can't be auto-created by kubernetes-conjur-demo
+    local cliManifest='
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conjur-cli
+  labels:
+    app: conjur-cli
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: conjur-cli
+  template:
+    metadata:
+      name: conjur-cli
+      labels:
+        app: conjur-cli
+    spec:
+      serviceAccountName: conjur-oss
+      containers:
+      - name: conjur-cli
+        image: cyberark/conjur-cli:5-6.2.6
+        imagePullPolicy: Always
+        command: ["sleep"]
+        args: ["infinity"]
+'
+    # TODO: move this whole script into its own file
+    runDockerCommand "
+set -xeuo pipefail
+
+cd '${workdir}'
+
+kubectl create namespace '${CONJUR_NAMESPACE_NAME}'
+
+helm --namespace '${CONJUR_NAMESPACE_NAME}' install \
+   --wait \
+   --timeout 120s \
+   --set account.name=${CONJUR_ACCOUNT} \
+   --set account.create=true \
+   --set fullnameOverride=conjur-oss \
+   --set authenticators='authn-k8s/${AUTHENTICATOR_ID}\,authn' \
+   --set image.repository=registry.connect.redhat.com/cyberark/conjur \
+   --set image.tag=latest \
+   --set nginx.image.repository=registry.connect.redhat.com/cyberark/conjur-nginx \
+   --set nginx.image.tag=latest \
+   --set postgres.image.repository=registry.redhat.io/rhscl/postgresql-10-rhel7 \
+   --set postgres.image.tag=latest \
+   --set openshift.enabled=true \
+   --set service.external.enabled=false \
+   --set postgres.persistentVolume.create=false \
+   --set rbac.create=true \
+   --set 'dataKey=To7gsAFQOm7NlVnBWA3gFYlZIHC25pGwm/pMxlcHLUY=' \
+   '${HELM_RELEASE}' \
+   'https://github.com/cyberark/conjur-oss-helm-chart/releases/download/v${CONJUR_OSS_HELM_CHART_VERSION}/conjur-oss-${CONJUR_OSS_HELM_CHART_VERSION}.tgz'
+
+POD_NAME=\$(kubectl get pods --namespace '${CONJUR_NAMESPACE_NAME}' \
+   -l 'app=conjur-oss' \
+   -o jsonpath='{.items[0].metadata.name}')
+kubectl exec --namespace '${CONJUR_NAMESPACE_NAME}' \
+   \${POD_NAME} \
+   --container=conjur-oss \
+   -- conjurctl role retrieve-key ${CONJUR_ACCOUNT}:user:admin | tail -1 > conjur-admin-api-key
+export CONJUR_ADMIN_PASSWORD=\$(cat conjur-admin-api-key)
+# Allow pods with conjur-oss serviceaccount to run as root
+oc adm policy add-scc-to-user anyuid 'system:serviceaccount:${CONJUR_NAMESPACE_NAME}:conjur-oss'
+
+echo '${cliManifest}' | kubectl --namespace '${CONJUR_NAMESPACE_NAME}' apply -f -
+kubectl --namespace '${CONJUR_NAMESPACE_NAME}' wait --for=condition=available --timeout=60s deployment/conjur-cli
+"
+     CONJUR_ADMIN_PASSWORD=$(cat conjur-admin-api-key)
+  else
+    pushd ..
+      git clone --single-branch --branch master git@github.com:cyberark/kubernetes-conjur-deploy kubernetes-conjur-deploy-$UNIQUE_TEST_ID
+    popd
+
+    runDockerCommand "cd kubernetes-conjur-deploy-$UNIQUE_TEST_ID && ./start"
+  fi
+}
+
+function deployDemo() {
+  runDockerCommand "./start"
+}
+
+# Sets additional required environment variables that aren't available in the
+# secrets.yml file, and performs other preparatory steps
+function prepareTestEnvironment() {
+  # Set environment variables
+  local registry='registry2.itci.conjur.net/conjur-appliance'
+
+  export UNIQUE_TEST_ID="$(uuidgen | tr "[:upper:]" "[:lower:]" | head -c 10)"
+
+  export CONJUR_NAMESPACE_NAME=conjur-5-$UNIQUE_TEST_ID-test
+  export AUTHENTICATOR_ID=conjur-5-$UNIQUE_TEST_ID-test
+  export TEST_APP_NAMESPACE_NAME=test-app-5-$UNIQUE_TEST_ID
+  export CONFIGURE_CONJUR_MASTER=true
+
+  export DEPLOY_MASTER_CLUSTER=true
+
+  export MINI_ENV=false
+
+  export CONJUR_DEMO_TEST_IMAGE=conjur-demo-5-$UNIQUE_TEST_ID
+
+  export CONJUR_APPLIANCE_IMAGE=$registry:5.0-stable
+
+  # Prepare Docker images
+  docker pull $CONJUR_APPLIANCE_IMAGE
+  docker build --tag $CONJUR_DEMO_TEST_IMAGE:$CONJUR_NAMESPACE_NAME \
+    --file Dockerfile \
+    --build-arg OPENSHIFT_CLI_URL=$OPENSHIFT_CLI_URL \
+    --build-arg KUBECTL_CLI_URL=$KUBECTL_CLI_URL \
+    .
+}
+
+# Delete an image from GCR, unless it is has multiple tags pointing to it
+# This means another parallel build is using the image and we should
+# just untag it to be deleted by the later job
+function deleteRegistryImage() {
+  local image_and_tag=$1
+
+  IFS=':' read -r -a array <<< $image_and_tag
+  local image="${array[0]}"
+  local tag="${array[1]}"
+
+  if [[ "$PLATFORM" = "kubernetes" ]]; then
+    runDockerCommand "
+if gcloud container images list-tags $image | grep $tag; then
+  gcloud container images delete --force-delete-tags -q $image_and_tag
+fi
+    "
+  fi
+}
+
+function runDockerCommand() {
+  GCLOUD_INCLUDES=""
+  if [[ ! -z "${GCLOUD_SERVICE_KEY}" ]]; then
+    GCLOUD_INCLUDES="-v$GCLOUD_SERVICE_KEY:/tmp$GCLOUD_SERVICE_KEY"
+  fi
+
+  docker run --rm \
+    -i \
+    -e ANNOTATION_BASED_AUTHN \
+    -e CONJUR_OSS_HELM_INSTALLED \
+    -e HELM_RELEASE \
+    -e CONJUR_APPLIANCE_IMAGE \
+    -e CONJUR_NAMESPACE_NAME \
+    -e CONJUR_ACCOUNT \
+    -e CONJUR_ADMIN_PASSWORD \
+    -e AUTHENTICATOR_ID \
+    -e TEST_APP_NAMESPACE_NAME \
+    -e TEST_APP_DATABASE \
+    -e CONFIGURE_CONJUR_MASTER \
+    -e PLATFORM \
+    -e TEST_PLATFORM \
+    -e DOCKER_REGISTRY_URL \
+    -e DOCKER_REGISTRY_PATH \
+    -e PULL_DOCKER_REGISTRY_URL \
+    -e PULL_DOCKER_REGISTRY_PATH \
+    -e MINI_ENV \
+    -e DEPLOY_MASTER_CLUSTER \
+    -e GCLOUD_CLUSTER_NAME \
+    -e GCLOUD_ZONE \
+    -e GCLOUD_PROJECT_NAME \
+    -e OPENSHIFT_VERSION \
+    -e OPENSHIFT_URL \
+    -e OPENSHIFT_USERNAME \
+    -e OPENSHIFT_PASSWORD \
+    -e OSHIFT_CONJUR_ADMIN_USERNAME \
+    -e OSHIFT_CLUSTER_ADMIN_USERNAME \
+    -e CONJUR_LOG_LEVEL \
+    -e TEST_APP_LOADBALANCER_SVCS \
+    -e GCLOUD_SERVICE_KEY=/tmp$GCLOUD_SERVICE_KEY \
+    $GCLOUD_INCLUDES \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v ~/.config:/root/.config \
+    -v "$PWD/..":/src \
+    -w /src \
+    $CONJUR_DEMO_TEST_IMAGE:$CONJUR_NAMESPACE_NAME \
+    bash -c "
+      ./ci/platform_login
+      $1
+    "
+}
+
+function announce() {
+  echo "++++++++++++++++++++++++++++++++++++++"
+  echo ""
+  echo "$@"
+  echo ""
+  echo "++++++++++++++++++++++++++++++++++++++"
+}
+
+# Check that the argument values are valid
+function checkArguments() {
+  if [[ "$TEST_PLATFORM" != "gke" && "$TEST_PLATFORM" != "oc" ]]; then
+    echo "The only valid platform values are 'gke' and 'oc'"
+  elif [[ "$TEST_AUTHN_MODE" != "annotation-based" && "$TEST_AUTHN_MODE" != "host-id-based" ]]; then
+    echo "The only valid authentication modes are 'annotation-based' and 'host-id-based'"
+  else
+    if [[ "$TEST_PLATFORM" == "oc" ]]; then
+      version="${OPENSHIFT_VERSION:-UNKNOWN}"
+      announce "Test OpenShift Version $version"
+    fi
+    return 0
+  fi
+
+  printUsage
+}
+
+# Parse input arguments
+if [[ $# -ne 3 ]]; then
+  echo "Invalid number of arguments."
+  printUsage
+fi
+
+TEST_PLATFORM="$1"
+TEST_APP_DATABASE="$2"
+TEST_AUTHN_MODE="$3"
+
+export TEST_PLATFORM
+export TEST_APP_DATABASE
+if [[ "$TEST_AUTHN_MODE" == "annotation-based" ]]; then
+    export ANNOTATION_BASED_AUTHN=true
+else
+    export ANNOTATION_BASED_AUTHN=false
+fi
+
+# sensible default for OPENSHIFT_URL port
+if [[ -n "${OPENSHIFT_URL}" ]] && [[ ! "${OPENSHIFT_URL}" =~ :[[:digit:]] ]]; then
+ OPENSHIFT_URL="${OPENSHIFT_URL}:8443"
+fi
+
+main
