@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+# This script is an entry point, so init
+# is not assumed to have been run
+# shellcheck disable=SC2086
+. "$(dirname ${BASH_SOURCE[0]})/init"
+
+# Run BATS Tests
+"${BASH_LIB_DIR}/tests-for-this-repo/run-bats-tests"
+
+# Run Python Lint
+"${BASH_LIB_DIR}/tests-for-this-repo/run-python-lint"
+
+# Run gitleaks
+"${BASH_LIB_DIR}/tests-for-this-repo/run-gitleaks"
